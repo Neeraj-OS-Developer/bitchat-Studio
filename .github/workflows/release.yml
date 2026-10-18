@@ -6,9 +6,32 @@ on:
     tags:
       - 'v*.*.*' # Triggers for tags like v1.0.0
 
+# Default to least privilege; jobs elevate explicitly.
+permissions:
+  contents: read
+
+# Serialize releases on the same ref to avoid two runs racing the same
+# artifact / tag. Different refs (tag push vs. manual from a branch)
+# get different groups and run in parallel.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Single source of truth for the release tag — used by BOTH jobs and by
+# EVERY step that touches artifacts or release metadata.
+#   - Tag push  -> use the pushed tag (e.g. v1.0.0)
+#   - Manual    -> generate a unique tag (release-<run_number>)
+# This is what makes `workflow_dispatch` work with action-gh-release:
+# a tag_name is ALWAYS supplied, so the "GitHub Releases requires a tag"
+# error can no longer occur.
+env:
+  RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('release-{0}', github.run_number) }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -47,20 +70,24 @@ jobs:
           find app/build/outputs/apk/release -name "*.apk" -type f -exec ls -lh {} \;
 
       - name: Rename APKs for GitHub Release
+        shell: bash
         run: |
+          set -euo pipefail
           cd app/build/outputs/apk/release
-          [ -f "app-arm64-v8a-release-unsigned.apk" ] && mv app-arm64-v8a-release-unsigned.apk bitchat-android-arm64.apk
-          [ -f "app-x86_64-release-unsigned.apk" ] && mv app-x86_64-release-unsigned.apk bitchat-android-x86_64.apk
-          [ -f "app-universal-release-unsigned.apk" ] && mv app-universal-release-unsigned.apk bitchat-android-universal.apk
 
-      - name: DEBUG
-        run: |
-          set -x
-          pwd
-          ls -all
-          cd app/build/outputs/
-          ls -all
-          tree || ls -R
+          rename_if_exists() {
+            local src="$1" dst="$2"
+            if [ -f "$src" ]; then
+              mv "$src" "$dst"
+              echo "Renamed $src -> $dst"
+            else
+              echo "WARN: expected artifact '$src' not found"
+            fi
+          }
+
+          rename_if_exists app-arm64-v8a-release-unsigned.apk bitchat-android-arm64.apk
+          rename_if_exists app-x86_64-release-unsigned.apk    bitchat-android-x86_64.apk
+          rename_if_exists app-universal-release-unsigned.apk bitchat-android-universal.apk
 
       # Optional: Sign APKs (uncomment and configure secrets when ready)
       # - name: Sign APKs
@@ -75,7 +102,9 @@ jobs:
       - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bitchat-android-release-${{ github.ref_name }}
+          # MUST match the download name in the `release` job.
+          # Both are derived from env.RELEASE_TAG -> mismatch is impossible.
+          name: bitchat-android-release-${{ env.RELEASE_TAG }}
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
           if-no-files-found: error
@@ -83,25 +112,37 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for softprops/action-gh-release
 
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: bitchat-android-release-${{ github.ref_name }}
+          # Same expression as upload -> same name -> guaranteed to match.
+          name: bitchat-android-release-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Always supplied: real tag on tag-push, generated tag on manual.
+          tag_name: ${{ env.RELEASE_TAG }}
+          # Ignored on tag pushes (tag already exists). On manual runs it
+          # makes the auto-created tag point at the exact commit that was
+          # built, instead of the default branch HEAD.
+          target_commitish: ${{ github.sha }}
           files: |
             release/bitchat-android-arm64.apk
             release/bitchat-android-x86_64.apk
             release/bitchat-android-universal.apk
-          name: Release ${{ github.ref_name }}
+          name: Release ${{ env.RELEASE_TAG }}
           body: |
+            Automated release: **${{ env.RELEASE_TAG }}**
+
             **bitchat-android-arm64.apk** - ARM64 (most phones)
             **bitchat-android-x86_64.apk** - x86_64 (Chromebooks, tablets)
             **bitchat-android-universal.apk** - All architectures (fallback)
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
