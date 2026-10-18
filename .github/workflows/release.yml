@@ -10,9 +10,7 @@ on:
 permissions:
   contents: read
 
-# Serialize releases on the same ref to avoid two runs racing the same
-# artifact / tag. Different refs (tag push vs. manual from a branch)
-# get different groups and run in parallel.
+# Serialize releases on the same ref to avoid two runs racing.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -21,9 +19,7 @@ concurrency:
 # EVERY step that touches artifacts or release metadata.
 #   - Tag push  -> use the pushed tag (e.g. v1.0.0)
 #   - Manual    -> generate a unique tag (release-<run_number>)
-# This is what makes `workflow_dispatch` work with action-gh-release:
-# a tag_name is ALWAYS supplied, so the "GitHub Releases requires a tag"
-# error can no longer occur.
+# This is what makes `workflow_dispatch` work with action-gh-release.
 env:
   RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('release-{0}', github.run_number) }}
 
@@ -64,10 +60,10 @@ jobs:
       - name: Build Release APKs (with architecture splits)
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: List APK files
+      - name: List APK files (pre-rename)
         run: |
-          echo "APK files built:"
-          find app/build/outputs/apk/release -name "*.apk" -type f -exec ls -lh {} \;
+          echo "=== APK files built (recursive) ==="
+          find app/build/outputs/apk -name "*.apk" -type f -exec ls -lh {} \; || true
 
       - name: Rename APKs for GitHub Release
         shell: bash
@@ -75,19 +71,39 @@ jobs:
           set -euo pipefail
           cd app/build/outputs/apk/release
 
-          rename_if_exists() {
-            local src="$1" dst="$2"
-            if [ -f "$src" ]; then
-              mv "$src" "$dst"
-              echo "Renamed $src -> $dst"
+          echo "=== Directory before rename ==="
+          ls -la
+
+          # Matches both signed (`-release.apk`) and unsigned
+          # (`-release-unsigned.apk`) Gradle outputs.
+          rename_first_match() {
+            local pattern="$1" dst="$2"
+            local match
+            match=$(find . -maxdepth 1 -type f -name "$pattern" | head -n1)
+            if [ -n "$match" ]; then
+              mv "$match" "$dst"
+              echo "Renamed $match -> $dst"
             else
-              echo "WARN: expected artifact '$src' not found"
+              echo "WARN: no file matched '$pattern'"
             fi
           }
 
-          rename_if_exists app-arm64-v8a-release-unsigned.apk bitchat-android-arm64.apk
-          rename_if_exists app-x86_64-release-unsigned.apk    bitchat-android-x86_64.apk
-          rename_if_exists app-universal-release-unsigned.apk bitchat-android-universal.apk
+          rename_first_match 'app-arm64-v8a-release*.apk' bitchat-android-arm64.apk
+          rename_first_match 'app-x86_64-release*.apk'    bitchat-android-x86_64.apk
+          rename_first_match 'app-universal-release*.apk' bitchat-android-universal.apk
+
+          # Fallback: if Gradle produced a single (non-split) release APK,
+          # treat it as the universal artifact.
+          if [ ! -f bitchat-android-universal.apk ] && [ ! -f bitchat-android-arm64.apk ] && [ ! -f bitchat-android-x86_64.apk ]; then
+            single=$(find . -maxdepth 1 -type f -name 'app-release*.apk' | head -n1)
+            if [ -n "$single" ]; then
+              mv "$single" bitchat-android-universal.apk
+              echo "Single-APK fallback: renamed $single -> bitchat-android-universal.apk"
+            fi
+          fi
+
+          echo "=== Directory after rename ==="
+          ls -la
 
       # Optional: Sign APKs (uncomment and configure secrets when ready)
       # - name: Sign APKs
@@ -102,8 +118,6 @@ jobs:
       - name: Upload APKs as artifacts
         uses: actions/upload-artifact@v4
         with:
-          # MUST match the download name in the `release` job.
-          # Both are derived from env.RELEASE_TAG -> mismatch is impossible.
           name: bitchat-android-release-${{ env.RELEASE_TAG }}
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
@@ -113,36 +127,68 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required for softprops/action-gh-release
+      contents: write # required for softprops/action-gh-release
 
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          # Same expression as upload -> same name -> guaranteed to match.
           name: bitchat-android-release-${{ env.RELEASE_TAG }}
           path: release
+
+      - name: Inspect downloaded artifact (diagnostic)
+        run: |
+          echo "=== Contents of release/ (recursive) ==="
+          find release -type f -exec ls -lh {} \; || true
+
+      - name: Prepare release metadata (dynamic)
+        id: meta
+        shell: bash
+        working-directory: release
+        run: |
+          set -euo pipefail
+
+          # Discover APKs recursively — immune to whatever subpath the
+          # upload/download round-trip produced.
+          mapfile -t apks < <(find . -type f -name '*.apk' | sort)
+
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No APK files found in downloaded artifact"
+            echo "Full tree of release/:"
+            find . -type f | sort
+            exit 1
+          fi
+
+          {
+            echo "files<<__FILES_EOF__"
+            for apk in "${apks[@]}"; do
+              # Absolute path (PWD == release/ working dir) — works no matter
+              # what directory action-gh-release runs from.
+              echo "$PWD/${apk#./}"
+            done
+            echo "__FILES_EOF__"
+
+            echo "body<<__BODY_EOF__"
+            echo "Automated release: **${{ env.RELEASE_TAG }}**"
+            echo ""
+            for apk in "${apks[@]}"; do
+              size=$(du -h "$apk" | cut -f1)
+              echo "- \`$(basename "$apk")\` (${size})"
+            done
+            echo "__BODY_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "=== Resolved file list ==="
+          for apk in "${apks[@]}"; do echo "$apk"; done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Always supplied: real tag on tag-push, generated tag on manual.
           tag_name: ${{ env.RELEASE_TAG }}
-          # Ignored on tag pushes (tag already exists). On manual runs it
-          # makes the auto-created tag point at the exact commit that was
-          # built, instead of the default branch HEAD.
           target_commitish: ${{ github.sha }}
-          files: |
-            release/bitchat-android-arm64.apk
-            release/bitchat-android-x86_64.apk
-            release/bitchat-android-universal.apk
+          files: ${{ steps.meta.outputs.files }}
           name: Release ${{ env.RELEASE_TAG }}
-          body: |
-            Automated release: **${{ env.RELEASE_TAG }}**
-
-            **bitchat-android-arm64.apk** - ARM64 (most phones)
-            **bitchat-android-x86_64.apk** - x86_64 (Chromebooks, tablets)
-            **bitchat-android-universal.apk** - All architectures (fallback)
+          body: ${{ steps.meta.outputs.body }}
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
