@@ -22,6 +22,17 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("../local.jks")
+            storePassword = "456987"
+            keyAlias = "local"
+            keyPassword = "456987"
+            isV1SigningEnabled = true
+            isV2SigningEnabled = true
+        }
+    }
+
     dependenciesInfo {
         // Disables dependency metadata when building APKs.
         includeInApk = false
@@ -39,6 +50,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
