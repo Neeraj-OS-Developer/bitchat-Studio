@@ -2,7 +2,6 @@ package com.bitchat.android.ui
 
 import android.app.Application
 import android.util.Log
-import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bitchat.android.favorites.FavoritesPersistenceService
@@ -34,6 +33,11 @@ import com.bitchat.android.util.hexEncodedString
 /**
  * Refactored ChatViewModel - Main coordinator for bitchat functionality
  * Delegates specific responsibilities to specialized managers while maintaining 100% iOS compatibility
+ *
+ * ⭐ File 12: now uses [NotificationManager.getInstance] so the UI side and the
+ * headless [com.bitchat.android.service.MeshNotificationDelegate] share the exact
+ * same NotificationManager instance. This guarantees a single source of truth for
+ * app-background state, view-state suppression, and pending-notification maps.
  */
 class ChatViewModel(
     application: Application,
@@ -103,11 +107,11 @@ class ChatViewModel(
 
     val privateChatManager = PrivateChatManager(state, messageManager, dataManager, noiseSessionDelegate)
     private val commandProcessor = CommandProcessor(state, messageManager, channelManager, privateChatManager)
-    private val notificationManager = NotificationManager(
-      application.applicationContext,
-      NotificationManagerCompat.from(application.applicationContext),
-      NotificationIntervalManager()
-    )
+
+    // ⭐ File 12: use the process-wide singleton so UI side, AppLifecycleObserver,
+    // and MeshNotificationDelegate all share the same background state / maps.
+    private val notificationManager: NotificationManager =
+        NotificationManager.getInstance(application.applicationContext)
 
     private val verificationHandler = VerificationHandler(
         context = application.applicationContext,
@@ -122,7 +126,7 @@ class ChatViewModel(
 
     // Media file sending manager
     private val mediaSendingManager = MediaSendingManager(state, messageManager, channelManager) { mesh }
-    
+
     // Delegate handler for mesh callbacks
     private val meshDelegateHandler = MeshDelegateHandler(
         state = state,
@@ -135,7 +139,7 @@ class ChatViewModel(
         getMyPeerID = { mesh.myPeerID },
         getMeshService = { mesh }
     )
-    
+
     // New Geohash architecture ViewModel (replaces God object service usage in UI path)
     val geohashViewModel = GeohashViewModel(
         application = application,
@@ -146,10 +150,6 @@ class ChatViewModel(
         dataManager = dataManager,
         notificationManager = notificationManager
     )
-
-
-
-
 
     val messages: StateFlow<List<BitchatMessage>> = state.messages
     val connectedPeers: StateFlow<List<String>> = state.connectedPeers
@@ -246,25 +246,23 @@ class ChatViewModel(
                 mediaSendingManager.handleTransferProgressEvent(evt)
             }
         }
-        
-        // Removed background location notes subscription. Notes now load only when sheet opens.
     }
 
     fun cancelMediaSend(messageId: String) {
         // Delegate to MediaSendingManager which tracks transfer IDs and cleans up UI state
         mediaSendingManager.cancelMediaSend(messageId)
     }
-    
+
     private fun loadAndInitialize() {
         // Load nickname
         val nickname = dataManager.loadNickname()
         state.setNickname(nickname)
-        
+
         // Load data
         val (joinedChannels, protectedChannels) = channelManager.loadChannelData()
         state.setJoinedChannels(joinedChannels)
         state.setPasswordProtectedChannels(protectedChannels)
-        
+
         // Initialize channel messages
         joinedChannels.forEach { channel ->
             if (!state.getChannelMessagesValue().containsKey(channel)) {
@@ -273,7 +271,7 @@ class ChatViewModel(
                 state.setChannelMessages(updatedChannelMessages)
             }
         }
-        
+
         // Load other data
         dataManager.loadFavorites()
         state.setFavoritePeers(dataManager.favoritePeers.toSet())
@@ -283,7 +281,7 @@ class ChatViewModel(
         // Log all favorites at startup
         dataManager.logAllFavorites()
         logCurrentFavoriteState()
-        
+
         // Initialize session state monitoring
         initializeSessionStateMonitoring()
 
@@ -302,7 +300,7 @@ class ChatViewModel(
                 }
             }
         }
-        
+
         // Initialize new geohash architecture
         geohashViewModel.initialize()
 
@@ -323,20 +321,20 @@ class ChatViewModel(
 
         // BLE receives are inserted by MessageHandler path; no VoiceNoteBus for Tor in this branch.
     }
-    
+
     override fun onCleared() {
         super.onCleared()
         // Note: Mesh service lifecycle is now managed by MainActivity
     }
-    
+
     // MARK: - Nickname Management
-    
+
     fun setNickname(newNickname: String) {
         state.setNickname(newNickname)
         dataManager.saveNickname(newNickname)
         mesh.sendBroadcastAnnounce()
     }
-    
+
     /**
      * Ensure Nostr DM subscription for a geohash conversation key if known
      * Minimal-change approach: reflectively access GeohashViewModel internals to reuse pipeline
@@ -378,28 +376,28 @@ class ChatViewModel(
     }
 
     // MARK: - Channel Management (delegated)
-    
+
     fun joinChannel(channel: String, password: String? = null): Boolean {
         return channelManager.joinChannel(channel, password, mesh.myPeerID)
     }
-    
+
     fun switchToChannel(channel: String?) {
         channelManager.switchToChannel(channel)
     }
-    
+
     fun leaveChannel(channel: String) {
         channelManager.leaveChannel(channel)
         mesh.sendMessage("left $channel", emptyList(), null)
     }
-    
+
     // MARK: - Private Chat Management (delegated)
-    
+
     fun startPrivateChat(peerID: String) {
         // For geohash conversation keys, ensure DM subscription is active
         if (peerID.startsWith("nostr_")) {
             ensureGeohashDMSubscriptionIfNeeded(peerID)
         }
-        
+
         val success = privateChatManager.startPrivateChat(peerID, mesh)
         if (success) {
             val conversationID = ContactDirectory.canonicalConversationId(peerID)
@@ -420,7 +418,7 @@ class ChatViewModel(
             } catch (_: Exception) { }
         }
     }
-    
+
     fun endPrivateChat() {
         privateChatManager.endPrivateChat()
         // Notify notification manager that no private chat is active
@@ -484,12 +482,11 @@ class ChatViewModel(
 
     // END - Open Latest Unread Private Chat
 
-    
     // MARK: - Message Sending
-    
+
     fun sendMessage(content: String) {
         if (content.isEmpty()) return
-        
+
         // Check for commands
         if (content.startsWith("/")) {
             val selectedLocationForCommand = state.selectedLocationChannel.value
@@ -508,11 +505,11 @@ class ChatViewModel(
             }, this)
             return
         }
-        
+
         val mentions = messageManager.parseMentions(content, mesh.getPeerNicknames().values.toSet(), state.getNicknameValue())
         var selectedPeer = state.getSelectedPrivateChatPeerValue()
         val currentChannelValue = state.getCurrentChannelValue()
-        
+
         if (selectedPeer != null) {
             // If the selected peer is a temporary Nostr alias or a noise-hex identity, resolve to a canonical target
             selectedPeer = ContactDirectory.canonicalConversationId(
@@ -535,8 +532,8 @@ class ChatViewModel(
             // Send private message
             val recipientNickname = nicknameForPeer(selectedPeer)
             privateChatManager.sendPrivateMessage(
-                content, 
-                selectedPeer, 
+                content,
+                selectedPeer,
                 recipientNickname,
                 state.getNicknameValue(),
                 mesh.myPeerID
@@ -595,11 +592,11 @@ class ChatViewModel(
     }
 
     // MARK: - Utility Functions
-    
+
     fun getPeerIDForNickname(nickname: String): String? {
         return mesh.getPeerNicknames().entries.find { it.value == nickname }?.key
     }
-    
+
     fun toggleFavorite(peerID: String) {
         Log.d("ChatViewModel", "toggleFavorite called for peerID: $peerID")
         privateChatManager.toggleFavorite(peerID)
@@ -647,7 +644,7 @@ class ChatViewModel(
         // Log current state after toggle
         logCurrentFavoriteState()
     }
-    
+
     private fun logCurrentFavoriteState() {
         Log.i("ChatViewModel", "=== CURRENT FAVORITE STATE ===")
         Log.i("ChatViewModel", "StateFlow favorite peers: ${favoritePeers.value}")
@@ -689,7 +686,7 @@ class ChatViewModel(
     private fun sessionStateForPeer(peerID: String): NoiseSession.NoiseSessionState {
         return try { mesh.getSessionState(peerID) } catch (_: Exception) { NoiseSession.NoiseSessionState.Uninitialized }
     }
-    
+
     /**
      * Initialize session state monitoring for reactive UI updates
      */
@@ -701,15 +698,15 @@ class ChatViewModel(
             }
         }
     }
-    
+
     // Location notes subscription management moved to LocationNotesViewModelExtensions.kt
-    
+
     /**
      * Update reactive states for all connected peers (session states, fingerprints, nicknames, RSSI)
      */
     private fun updateReactiveStates() {
         val currentPeers = state.getConnectedPeersValue()
-        
+
         // Update session states
         val prevStates = state.getPeerSessionStatesValue()
         val sessionStates = currentPeers.associateWith { peerID ->
@@ -762,7 +759,7 @@ class ChatViewModel(
     }
 
     // MARK: - QR Verification
-    
+
     fun isPeerVerified(peerID: String, verifiedFingerprints: Set<String>): Boolean {
         if (peerID.startsWith("nostr_") || peerID.startsWith("nostr:")) return false
         val fingerprint = verificationHandler.getPeerFingerprintForDisplay(peerID)
@@ -783,15 +780,15 @@ class ChatViewModel(
     }
 
     // MARK: - Debug and Troubleshooting
-    
+
     fun getDebugStatus(): String {
         return mesh.getDebugStatus()
     }
-    
+
     fun setCurrentPrivateChatPeer(peerID: String?) {
         notificationManager.setCurrentPrivateChatPeer(peerID)
     }
-    
+
     fun setCurrentGeohash(geohash: String?) {
         notificationManager.setCurrentGeohash(geohash)
     }
@@ -799,7 +796,7 @@ class ChatViewModel(
     fun clearNotificationsForSender(peerID: String) {
         notificationManager.clearNotificationsForSender(peerID)
     }
-    
+
     fun clearNotificationsForGeohash(geohash: String) {
         notificationManager.clearNotificationsForGeohash(geohash)
     }
@@ -871,31 +868,31 @@ class ChatViewModel(
     }
 
     // MARK: - Command Autocomplete (delegated)
-    
+
     fun updateCommandSuggestions(input: String) {
         commandProcessor.updateCommandSuggestions(input)
     }
-    
+
     fun selectCommandSuggestion(suggestion: CommandSuggestion): String {
         return commandProcessor.selectCommandSuggestion(suggestion)
     }
-    
+
     // MARK: - Mention Autocomplete
-    
+
     fun updateMentionSuggestions(input: String) {
         commandProcessor.updateMentionSuggestions(input, mesh, this)
     }
-    
+
     fun selectMentionSuggestion(nickname: String, currentText: String): String {
         return commandProcessor.selectMentionSuggestion(nickname, currentText)
     }
-    
+
     // MARK: - BluetoothMeshDelegate Implementation (delegated)
-    
+
     override fun didReceiveMessage(message: BitchatMessage) {
         meshDelegateHandler.didReceiveMessage(message)
     }
-    
+
     override fun didUpdatePeerList(peers: List<String>) {
         meshDelegateHandler.didUpdatePeerList(peers)
     }
@@ -903,11 +900,11 @@ class ChatViewModel(
     override fun didReceiveChannelLeave(channel: String, fromPeer: String) {
         meshDelegateHandler.didReceiveChannelLeave(channel, fromPeer)
     }
-    
+
     override fun didReceiveDeliveryAck(messageID: String, recipientPeerID: String) {
         meshDelegateHandler.didReceiveDeliveryAck(messageID, recipientPeerID)
     }
-    
+
     override fun didReceiveReadReceipt(messageID: String, recipientPeerID: String) {
         meshDelegateHandler.didReceiveReadReceipt(messageID, recipientPeerID)
     }
@@ -919,47 +916,47 @@ class ChatViewModel(
     override fun didReceiveVerifyResponse(peerID: String, payload: ByteArray, timestampMs: Long) {
         verificationHandler.didReceiveVerifyResponse(peerID, payload)
     }
-    
+
     override fun decryptChannelMessage(encryptedContent: ByteArray, channel: String): String? {
         return meshDelegateHandler.decryptChannelMessage(encryptedContent, channel)
     }
-    
+
     override fun getNickname(): String? {
         return meshDelegateHandler.getNickname()
     }
-    
+
     override fun isFavorite(peerID: String): Boolean {
         return meshDelegateHandler.isFavorite(peerID)
     }
-    
+
     // MARK: - Emergency Clear
-    
+
     fun panicClearAllData() {
         Log.w(TAG, "🚨 PANIC MODE ACTIVATED - Clearing all sensitive data")
-        
+
         // Clear all UI managers
         messageManager.clearAllMessages()
         channelManager.clearAllChannels()
         privateChatManager.clearAllPrivateChats()
         dataManager.clearAllData()
-        
+
         // Clear seen message store
         try {
             com.bitchat.android.services.SeenMessageStore.getInstance(getApplication()).clear()
         } catch (_: Exception) { }
-        
+
         // Clear all mesh service data
         clearAllMeshServiceData()
-        
+
         // Clear all cryptographic data
         clearAllCryptographicData()
-        
+
         // Clear all notifications
         notificationManager.clearAllNotifications()
 
         // Clear all media files
         com.bitchat.android.features.file.FileUtils.clearAllMedia(getApplication())
-        
+
         // Clear Nostr/geohash state, keys, connections, bookmarks, and reinitialize from scratch
         try {
             // Clear geohash bookmarks too (panic should remove everything)
@@ -982,7 +979,7 @@ class ChatViewModel(
         val newNickname = "anon${Random.nextInt(1000, 9999)}"
         state.setNickname(newNickname)
         dataManager.saveNickname(newNickname)
-        
+
         // Recreate mesh service with fresh identity
         recreateMeshServiceAfterPanic()
 
@@ -1017,7 +1014,7 @@ class ChatViewModel(
             "✅ Mesh service recreated. Old peerID: $oldPeerID, New peerID: ${mesh.myPeerID}"
         )
     }
-    
+
     /**
      * Clear all mesh service related data
      */
@@ -1025,13 +1022,13 @@ class ChatViewModel(
         try {
             // Request mesh service to clear all its internal data
             mesh.clearAllInternalData()
-            
+
             Log.d(TAG, "✅ Cleared all mesh service data")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error clearing mesh service data: ${e.message}")
         }
     }
-    
+
     /**
      * Clear all cryptographic data including persistent identity
      */
@@ -1039,7 +1036,7 @@ class ChatViewModel(
         try {
             // Clear encryption service persistent identity (Ed25519 signing keys)
             mesh.clearAllEncryptionData()
-            
+
             // Clear secure identity state (if used)
             try {
                 val identityManager = SecureIdentityStateManager(getApplication())
@@ -1058,7 +1055,7 @@ class ChatViewModel(
                 FavoritesPersistenceService.shared.clearAllFavorites()
                 Log.d(TAG, "✅ Cleared FavoritesPersistenceService relationships")
             } catch (_: Exception) { }
-            
+
             Log.d(TAG, "✅ Cleared all cryptographic data")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error clearing cryptographic data: ${e.message}")
@@ -1126,11 +1123,11 @@ class ChatViewModel(
     }
 
     // MARK: - Navigation Management
-    
+
     fun showAppInfo() {
         state.setShowAppInfo(true)
     }
-    
+
     fun hideAppInfo() {
         state.setShowAppInfo(false)
     }
@@ -1183,6 +1180,5 @@ class ChatViewModel(
      */
     fun colorForNostrPubkey(pubkeyHex: String, isDark: Boolean): androidx.compose.ui.graphics.Color {
         return geohashViewModel.colorForNostrPubkey(pubkeyHex, isDark)
-}
-
+    }
 }
