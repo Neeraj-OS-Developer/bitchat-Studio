@@ -10,9 +10,13 @@ import com.bitchat.android.sync.GossipSyncManager
 /**
  * Process-wide holder to share a single BluetoothMeshService instance
  * between the foreground service and UI (MainActivity/ViewModels).
+ *
+ * ⭐ NEW: also owns the headless [MeshNotificationDelegate] used when the UI is
+ * closed so the foreground service can drive notifications without a ViewModel.
  */
 object MeshServiceHolder {
     private const val TAG = "MeshServiceHolder"
+
     @Volatile
     var sharedGossipSyncManager: GossipSyncManager? = null
         private set
@@ -76,6 +80,11 @@ object MeshServiceHolder {
     var unifiedMeshService: UnifiedMeshService? = null
         private set
 
+    // ⭐ NEW: headless notification delegate for the foreground service.
+    // Created lazily on first request, reused until clear() is called.
+    @Volatile
+    private var notificationDelegate: MeshNotificationDelegate? = null
+
     @Synchronized
     fun getOrCreate(context: Context): BluetoothMeshService {
         val existing = meshService
@@ -133,9 +142,85 @@ object MeshServiceHolder {
         unifiedMeshService = null
     }
 
+    // ⭐ NEW: notification delegate management
+
+    /**
+     * Get or lazily create the headless [MeshNotificationDelegate].
+     * Safe to call from any thread. Same instance is returned until [clear] is called.
+     */
+    @Synchronized
+    fun getNotificationDelegate(context: Context): MeshNotificationDelegate {
+        return notificationDelegate ?: MeshNotificationDelegate(context.applicationContext).also {
+            notificationDelegate = it
+            android.util.Log.i(TAG, "Created MeshNotificationDelegate")
+        }
+    }
+
+    /**
+     * Convenience accessor — returns null if never created yet.
+     * Use [getNotificationDelegate] if you want to force creation.
+     */
+    fun peekNotificationDelegate(): MeshNotificationDelegate? = notificationDelegate
+
+    /**
+     * Install the headless delegate on UnifiedMeshService as the active delegate.
+     * Call this when the UI goes to background (onPause/onStop).
+     * Also (re-)attaches to reset stale view state (currentPrivateChatPeer, currentGeohash).
+     */
+    @Synchronized
+    fun attachNotificationDelegate(context: Context) {
+        val unified = unifiedMeshService ?: run {
+            android.util.Log.w(TAG, "attachNotificationDelegate: no UnifiedMeshService yet")
+            return
+        }
+        val delegate = getNotificationDelegate(context)
+        delegate.attach()
+        unified.delegate = delegate
+        android.util.Log.d(TAG, "Installed MeshNotificationDelegate as active mesh delegate")
+    }
+
+    /**
+     * Detach (called on service stop / shutdown).
+     * Does not destroy the delegate; the same instance is reused on next start
+     * so its internal caches (nickname) survive across service restarts.
+     */
+    @Synchronized
+    fun detachNotificationDelegate() {
+        try {
+            notificationDelegate?.detach()
+        } catch (_: Exception) { }
+        try {
+            // Only clear if the delegate is currently the active one.
+            if (unifiedMeshService?.delegate === notificationDelegate) {
+                unifiedMeshService?.delegate = null
+            }
+        } catch (_: Exception) { }
+        android.util.Log.d(TAG, "Detached MeshNotificationDelegate")
+    }
+
+    /**
+     * ⭐ NEW: Reset peer connect/disconnect tracking on the unified service.
+     * Called from panic mode so the next connected peer fires a fresh notification
+     * even if the underlying peer ID happens to repeat.
+     */
+    @Synchronized
+    fun resetPeerLifecycleTracking() {
+        try {
+            unifiedMeshService?.resetPeerLifecycleTracking()
+            android.util.Log.d(TAG, "Reset peer lifecycle tracking on UnifiedMeshService")
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "resetPeerLifecycleTracking failed: ${e.message}")
+        }
+    }
+
     @Synchronized
     fun clear() {
         android.util.Log.d(TAG, "Clearing BluetoothMeshService from holder")
+        // Drop notification delegate first so its attach() won't fire on a
+        // service that is about to disappear.
+        try { notificationDelegate?.detach() } catch (_: Exception) { }
+        notificationDelegate = null
+
         try { sharedGossipSyncManager?.stop() } catch (_: Exception) { }
         sharedGossipSyncManager = null
         activeGossipOwners.clear()
