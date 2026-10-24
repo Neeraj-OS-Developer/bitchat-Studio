@@ -23,11 +23,29 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+/**
+ * Always-on foreground service that owns the mesh pipeline.
+ *
+ * Responsibilities:
+ *   - Keeps [BluetoothMeshService] + [com.bitchat.android.wifiaware.WifiAwareMeshService] alive
+ *     across UI backgrounding and process restarts (START_STICKY).
+ *   - Owns the headless [MeshNotificationDelegate] while the UI is closed so peer
+ *     connects and private messages still produce notifications.
+ *
+ * Delegate ownership:
+ *   - [MeshServiceHolder.unifiedMeshService] is the single source of truth for the
+ *     active delegate.
+ *   - UI is foreground → [com.bitchat.android.ui.ChatViewModel] is set by MainActivity.
+ *   - UI backgrounds → MainActivity calls [MeshServiceHolder.attachNotificationDelegate].
+ *   - Fresh service start (no UI yet) → this service installs [MeshNotificationDelegate]
+ *     as a fallback so nothing is missed in the window before the UI appears.
+ */
 class MeshForegroundService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "bitchat_mesh_service"
         private const val NOTIFICATION_ID = 10001
+        private const val TAG = "MeshForegroundService"
 
         const val ACTION_START = "com.bitchat.android.service.START"
         const val ACTION_STOP = "com.bitchat.android.service.STOP"
@@ -45,16 +63,13 @@ class MeshForegroundService : Service() {
                 if (shouldStartForeground) {
                     context.startForegroundService(intent)
                 } else {
-                    android.util.Log.i(
-                        "MeshForegroundService",
-                        "Not starting service on API>=26 (shouldStartForeground=$shouldStartForeground)"
-                    )
+                    Log.i(TAG, "Not starting service on API>=26 (shouldStartForeground=$shouldStartForeground)")
                 }
             } else {
                 if (MeshServicePreferences.isBackgroundEnabled(true)) {
                     context.startService(intent)
                 } else {
-                    android.util.Log.i("MeshForegroundService", "Background disabled; not starting service (pre-O)")
+                    Log.i(TAG, "Background disabled; not starting service (pre-O)")
                 }
             }
         }
@@ -124,13 +139,30 @@ class MeshForegroundService : Service() {
         // Ensure mesh service exists in holder (create if needed)
         val existing = MeshServiceHolder.meshService
         if (existing != null) {
-            Log.d("MeshForegroundService", "Using existing BluetoothMeshService from holder")
+            Log.d(TAG, "Using existing BluetoothMeshService from holder")
         } else {
             val created = MeshServiceHolder.getOrCreate(applicationContext)
-            Log.i("MeshForegroundService", "Created new BluetoothMeshService via holder")
+            Log.i(TAG, "Created new BluetoothMeshService via holder")
             MeshServiceHolder.attach(created)
         }
         MeshServiceHolder.getUnifiedOrCreate(applicationContext)
+
+        // ⭐ NEW: Pre-warm the headless notification delegate so MainActivity.onPause
+        // can install it without a lazy-init delay. Then, if no UI delegate is
+        // currently attached (fresh boot / process restart), make it the active
+        // delegate so notifications work even before the UI appears.
+        try {
+            val unified = MeshServiceHolder.getUnifiedOrCreate(applicationContext)
+            MeshServiceHolder.getNotificationDelegate(applicationContext) // pre-warm
+            if (unified.delegate == null) {
+                MeshServiceHolder.attachNotificationDelegate(applicationContext)
+                Log.i(TAG, "Installed MeshNotificationDelegate (no UI delegate present)")
+            } else {
+                Log.d(TAG, "Existing delegate present; not overwriting with notification delegate")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to prepare notification delegate: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -145,6 +177,8 @@ class MeshForegroundService : Service() {
             ACTION_STOP -> {
                 // Stop FGS and mesh cleanly
                 try { unifiedMeshService?.stopServices() ?: meshService?.stopServices() } catch (_: Exception) { }
+                // ⭐ NEW: detach headless delegate before clearing the holder
+                try { MeshServiceHolder.detachNotificationDelegate() } catch (_: Exception) { }
                 try { MeshServiceHolder.clear() } catch (_: Exception) { }
                 try { stopForeground(true) } catch (_: Exception) { }
                 notificationManager.cancel(NOTIFICATION_ID)
@@ -226,7 +260,7 @@ class MeshForegroundService : Service() {
         try {
             com.bitchat.android.wifiaware.WifiAwareController.startIfPossible()
         } catch (e: Exception) {
-            android.util.Log.e("MeshForegroundService", "Failed to ensure Wi-Fi Aware transport: ${e.message}")
+            Log.e(TAG, "Failed to ensure Wi-Fi Aware transport: ${e.message}")
         }
 
         val bleEnabled = try {
@@ -240,11 +274,11 @@ class MeshForegroundService : Service() {
         }
         if (!hasBluetoothPermissions()) return
         try {
-            android.util.Log.d("MeshForegroundService", "Ensuring mesh service is started")
+            Log.d(TAG, "Ensuring mesh service is started")
             val service = MeshServiceHolder.getOrCreate(applicationContext)
             service.startServices()
         } catch (e: Exception) {
-            android.util.Log.e("MeshForegroundService", "Failed to start mesh service: ${e.message}")
+            Log.e(TAG, "Failed to start mesh service: ${e.message}")
         }
     }
 
@@ -368,8 +402,8 @@ class MeshForegroundService : Service() {
             } catch (e: SecurityException) {
                 // Fallback for cases where "While In Use" permission exists but background start is restricted
                 if (type and ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION != 0) {
-                     android.util.Log.w("MeshForegroundService", "Failed to start with LOCATION type, falling back to CONNECTED_DEVICE: ${e.message}")
-                     startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                    Log.w(TAG, "Failed to start with LOCATION type, falling back to CONNECTED_DEVICE: ${e.message}")
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
                 } else {
                     throw e
                 }
@@ -389,6 +423,10 @@ class MeshForegroundService : Service() {
             try { stopForeground(true) } catch (_: Exception) { }
             isInForeground = false
         }
+        // NOTE: We intentionally do NOT detach the notification delegate here.
+        // MeshServiceHolder keeps the instance for START_STICKY restarts and for
+        // the UI to re-take ownership on next Activity resume. Clean shutdown
+        // (ACTION_STOP / panic mode) detaches explicitly.
         super.onDestroy()
     }
 
