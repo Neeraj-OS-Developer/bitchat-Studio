@@ -7,6 +7,7 @@ import com.bitchat.android.model.BitchatFilePacket
 import com.bitchat.android.model.BitchatMessage
 import com.bitchat.android.noise.NoiseSession
 import com.bitchat.android.wifiaware.WifiAwareController
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Feature-facing mesh service that hides local transport selection from the rest of the app.
@@ -14,6 +15,10 @@ import com.bitchat.android.wifiaware.WifiAwareController
  * BLE remains the canonical origin for broadcast packets when it is enabled so existing BLE mesh
  * behavior and bridge semantics stay intact. Addressed Noise traffic is routed over whichever
  * local transport already has the peer/session, falling back to a connected transport handshake.
+ *
+ * ⭐ NEW: peer lifecycle (connect/disconnect) is derived by diffing the merged peer set on every
+ * [didUpdatePeerList] call. This gives a single, transport-agnostic source of truth for the
+ * headless notification layer without requiring per-transport event wiring.
  */
 class UnifiedMeshService(
     private val context: Context,
@@ -33,9 +38,32 @@ class UnifiedMeshService(
             refreshDelegates()
         }
 
+    // ⭐ NEW: peer lifecycle state
+    // - notifiedConnectedPeers: guard so didPeerConnect fires exactly once per peer lifetime
+    //   even if both BLE and WiFi aware report the same peer.
+    // - lastKnownPeers: last merged snapshot; used to compute new/gone peers.
+    // - isBaselineEstablished: first didUpdatePeerList is treated as baseline so a cold
+    //   start with N already-connected peers does not produce N notifications.
+    private val notifiedConnectedPeers = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var lastKnownPeers: Set<String> = emptySet()
+    @Volatile
+    private var isBaselineEstablished: Boolean = false
+
     fun refreshDelegates() {
         try { bluetooth.delegate = if (delegate != null) this else null } catch (_: Exception) { }
         try { wifiService()?.delegate = if (delegate != null) this else null } catch (_: Exception) { }
+    }
+
+    /**
+     * ⭐ NEW: Reset peer lifecycle tracking. Call from panic mode or service restart so the
+     * next didUpdatePeerList is treated as a fresh baseline.
+     */
+    fun resetPeerLifecycleTracking() {
+        notifiedConnectedPeers.clear()
+        lastKnownPeers = emptySet()
+        isBaselineEstablished = false
+        Log.d(TAG, "Peer lifecycle tracking reset")
     }
 
     override fun startServices() {
@@ -55,6 +83,8 @@ class UnifiedMeshService(
     override fun stopServices() {
         try { bluetooth.stopServices() } catch (_: Exception) { }
         try { WifiAwareController.stop() } catch (_: Exception) { }
+        // ⭐ NEW: clear lifecycle state on clean shutdown
+        resetPeerLifecycleTracking()
     }
 
     override fun sendMessage(content: String, mentions: List<String>, channel: String?) {
@@ -277,6 +307,8 @@ class UnifiedMeshService(
             appendLine("=== Unified Mesh Service Debug Status ===")
             appendLine("My Peer ID: $myPeerID")
             appendLine("Merged Peers: ${mergedPeerIDs().joinToString(", ")}")
+            appendLine("Baseline established: $isBaselineEstablished")
+            appendLine("Connected-notified peers: ${notifiedConnectedPeers.size}")
             appendLine()
             appendLine(bluetooth.getDebugStatus())
             wifiService()?.let {
@@ -289,6 +321,8 @@ class UnifiedMeshService(
     override fun clearAllInternalData() {
         try { bluetooth.clearAllInternalData() } catch (_: Exception) { }
         try { wifiService()?.clearAllInternalData() } catch (_: Exception) { }
+        // ⭐ NEW: reset peer lifecycle tracking so a fresh mesh can re-notify
+        resetPeerLifecycleTracking()
     }
 
     override fun clearAllEncryptionData() {
@@ -300,8 +334,89 @@ class UnifiedMeshService(
         delegate?.didReceiveMessage(message)
     }
 
+    /**
+     * ⭐ REPLACED: Derive peer connect/disconnect events from the merged peer list diff.
+     * This is the single source of truth for peer lifecycle across both transports.
+     */
     override fun didUpdatePeerList(peers: List<String>) {
-        delegate?.didUpdatePeerList(mergedPeerIDs().ifEmpty { peers.distinct() })
+        // Merged view for the UI (preserves existing behaviour: union of all known peers)
+        val mergedForUI = mergedPeerIDs().ifEmpty { peers.distinct() }
+
+        // Authoritative "currently connected" set: AppStateStore is updated by MeshCore
+        // (per-transport) right before this callback fires, so it is always fresh here.
+        val currentConnected: Set<String> = try {
+            com.bitchat.android.services.AppStateStore.peers.value.toSet()
+        } catch (_: Exception) {
+            peers.toSet()
+        }
+
+        // First invocation after service start: treat existing peers as baseline.
+        // Suppresses notification storms on cold boot / auto-start when many peers
+        // are already around.
+        if (!isBaselineEstablished) {
+            isBaselineEstablished = true
+            lastKnownPeers = currentConnected
+            notifiedConnectedPeers.addAll(currentConnected)
+            Log.d(TAG, "Baseline peer list established (${currentConnected.size} peers)")
+            delegate?.didUpdatePeerList(mergedForUI)
+            return
+        }
+
+        val newPeers = currentConnected - lastKnownPeers
+        val gonePeers = lastKnownPeers - currentConnected
+        lastKnownPeers = currentConnected
+
+        // Fire connect events for peers that just appeared
+        newPeers.forEach { peerID ->
+            if (notifiedConnectedPeers.add(peerID)) {
+                val nickname = getPeerNicknames()[peerID]?.takeIf { it.isNotBlank() } ?: peerID.take(8)
+                try {
+                    delegate?.didPeerConnect(peerID, nickname)
+                    Log.d(TAG, "Peer connected: $nickname ($peerID)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "didPeerConnect forward failed for $peerID: ${e.message}")
+                }
+            }
+        }
+
+        // Fire disconnect events for peers that fully left (both transports)
+        gonePeers.forEach { peerID ->
+            if (notifiedConnectedPeers.remove(peerID)) {
+                try {
+                    delegate?.didPeerDisconnect(peerID)
+                    Log.d(TAG, "Peer disconnected: $peerID")
+                } catch (e: Exception) {
+                    Log.w(TAG, "didPeerDisconnect forward failed for $peerID: ${e.message}")
+                }
+            }
+        }
+
+        delegate?.didUpdatePeerList(mergedForUI)
+    }
+
+    /**
+     * ⭐ NEW: If a transport forwards connect directly (future-proofing), dedupe and forward.
+     * The didUpdatePeerList diff remains the canonical path.
+     */
+    override fun didPeerConnect(peerID: String, nickname: String) {
+        if (notifiedConnectedPeers.add(peerID)) {
+            val safeNickname = nickname.takeIf { it.isNotBlank() } ?: peerID.take(8)
+            try {
+                delegate?.didPeerConnect(peerID, safeNickname)
+                Log.d(TAG, "Peer connected (direct signal): $safeNickname ($peerID)")
+            } catch (e: Exception) {
+                Log.w(TAG, "didPeerConnect (direct) forward failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * ⭐ NEW: Deliberately no-op. A disconnect from a single transport does not imply the
+     * peer has left the mesh — the didUpdatePeerList diff handles true disconnects when
+     * both transports lose the peer.
+     */
+    override fun didPeerDisconnect(peerID: String) {
+        // Intentionally empty — see class comment.
     }
 
     override fun didReceiveChannelLeave(channel: String, fromPeer: String) {
