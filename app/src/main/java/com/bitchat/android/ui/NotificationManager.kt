@@ -25,6 +25,8 @@ import java.util.concurrent.ConcurrentHashMap
  * - Support for first message notifications in geohash chats
  * - Proper notification management and cleanup
  * - Active peers notification
+ * - ⭐ NEW: Peer connect/disconnect notifications (headless, service-owned)
+ * - ⭐ NEW: Singleton access via getInstance(context) so service + UI share state
  */
 class NotificationManager(
   private val context: Context,
@@ -36,14 +38,20 @@ class NotificationManager(
         private const val TAG = "NotificationManager"
         private const val CHANNEL_ID = "bitchat_dm_notifications"
         private const val GEOHASH_CHANNEL_ID = "bitchat_geohash_notifications"
+        // ⭐ NEW: dedicated channel for peer connect notifications
+        private const val PEER_CONNECT_CHANNEL_ID = "bitchat_peer_connect"
         private const val GROUP_KEY_DM = "bitchat_dm_group"
         private const val GROUP_KEY_GEOHASH = "bitchat_geohash_group"
         private const val NOTIFICATION_REQUEST_CODE = 1000
         private const val GEOHASH_NOTIFICATION_REQUEST_CODE = 2000
         private const val SUMMARY_NOTIFICATION_ID = 999
-      private const val GEOHASH_SUMMARY_NOTIFICATION_ID = 998
+        private const val GEOHASH_SUMMARY_NOTIFICATION_ID = 998
         private const val ACTIVE_PEERS_NOTIFICATION_ID = 997
         private const val ACTIVE_PEERS_NOTIFICATION_TIME_INTERVAL = com.bitchat.android.util.AppConstants.UI.ACTIVE_PEERS_NOTIFICATION_INTERVAL_MS
+        // ⭐ NEW: notification ID base for per-peer connect notifications
+        private const val PEER_CONNECT_NOTIFICATION_BASE_ID = 5000
+        // ⭐ NEW: per-peer throttle window so flapping peers don't spam
+        private const val PEER_CONNECT_THROTTLE_MS = 60_000L
 
         // Intent extras for notification handling
         const val EXTRA_OPEN_PRIVATE_CHAT = "open_private_chat"
@@ -51,18 +59,41 @@ class NotificationManager(
         const val EXTRA_PEER_ID = "peer_id"
         const val EXTRA_SENDER_NICKNAME = "sender_nickname"
         const val EXTRA_GEOHASH = "geohash"
+
+        // ⭐ NEW: singleton instance so foreground service + UI share the same state
+        @Volatile
+        private var INSTANCE: NotificationManager? = null
+
+        /**
+         * ⭐ NEW: Process-wide singleton accessor.
+         * Used by MeshNotificationDelegate (service-owned) and UI code so
+         * background state / pending notification maps are shared.
+         */
+        fun getInstance(context: Context): NotificationManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: NotificationManager(
+                    context.applicationContext,
+                    NotificationManagerCompat.from(context.applicationContext),
+                    NotificationIntervalManager()
+                ).also { INSTANCE = it }
+            }
+        }
     }
 
     private val systemNotificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    
+
     // Track pending notifications per sender to enable grouping
     private val pendingNotifications = ConcurrentHashMap<String, MutableList<PendingNotification>>()
     private val pendingGeohashNotifications = ConcurrentHashMap<String, MutableList<GeohashNotification>>()
 
+    // ⭐ NEW: per-peer throttle map and active connect notification tracker
+    private val peerConnectThrottle = ConcurrentHashMap<String, Long>()
+    private val activePeerConnectNotifications = ConcurrentHashMap<String, Int>()
+
     // Track app background state
     @Volatile
     private var isAppInBackground = false
-    
+
     // Track current view state
     @Volatile
     private var currentPrivateChatPeer: String? = null
@@ -72,7 +103,7 @@ class NotificationManager(
 
     data class PendingNotification(
         val senderPeerID: String,
-        val senderNickname: String, 
+        val senderNickname: String,
         val messageContent: String,
         val timestamp: Long
     )
@@ -114,6 +145,22 @@ class NotificationManager(
                 setShowBadge(true)
             }
             systemNotificationManager.createNotificationChannel(geohashChannel)
+
+            // ⭐ NEW: Peer connect notifications channel — LOW importance, silent, no badge
+            // (Separate channel so user can mute these without muting DM/geohash notifications)
+            val peerConnectName = "Peer Connections"
+            val peerConnectDescription = "Silent notification when a new peer connects to the mesh"
+            val peerConnectChannel = NotificationChannel(
+                PEER_CONNECT_CHANNEL_ID,
+                peerConnectName,
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = peerConnectDescription
+                enableVibration(false)
+                setSound(null, null)
+                setShowBadge(false)
+            }
+            systemNotificationManager.createNotificationChannel(peerConnectChannel)
         }
     }
 
@@ -141,6 +188,79 @@ class NotificationManager(
         Log.d(TAG, "Current geohash changed: $geohash")
     }
 
+    // ⭐ NEW: Peer connect notification API
+
+    /**
+     * Show a lightweight "peer connected" notification.
+     * Only fires when app is in background. Silent channel. Per-peer 60s throttle.
+     * Tapping opens the DM chat with that peer (best UX).
+     */
+    fun showPeerConnectedNotification(peerID: String, nickname: String) {
+        try {
+            // Suppress when app is in foreground — user already sees the peer list
+            if (!isAppInBackground) {
+                Log.v(TAG, "Peer connect notification suppressed (app foreground) for $peerID")
+                return
+            }
+
+            // Per-peer throttle so a flapping connection doesn't spam
+            val now = System.currentTimeMillis()
+            val lastShown = peerConnectThrottle[peerID] ?: 0L
+            if (now - lastShown < PEER_CONNECT_THROTTLE_MS) {
+                Log.v(TAG, "Peer connect notification throttled for $peerID (${now - lastShown}ms since last)")
+                return
+            }
+            peerConnectThrottle[peerID] = now
+
+            // Deep-link: tap opens the DM chat with this peer
+            val conversationID = ContactDirectory.canonicalConversationId(peerID)
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_OPEN_PRIVATE_CHAT, true)
+                putExtra(EXTRA_PEER_ID, conversationID)
+                putExtra(EXTRA_SENDER_NICKNAME, nickname)
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                PEER_CONNECT_NOTIFICATION_BASE_ID + peerID.hashCode(),
+                intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+            val displayNickname = nickname.ifBlank { peerID.take(8) }
+            val builder = NotificationCompat.Builder(context, PEER_CONNECT_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(displayNickname)
+                .setContentText("connected to the mesh")
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setShowWhen(true)
+                .setWhen(now)
+                .setOnlyAlertOnce(true)
+                .setSilent(true)
+
+            val notificationId = PEER_CONNECT_NOTIFICATION_BASE_ID + peerID.hashCode()
+            activePeerConnectNotifications[peerID] = notificationId
+            notificationManager.notify(notificationId, builder.build())
+            Log.d(TAG, "Showed peer connect notification for $displayNickname ($peerID)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show peer connect notification: ${e.message}")
+        }
+    }
+
+    /**
+     * ⭐ NEW: Dismiss a peer's connect notification (call on disconnect)
+     */
+    fun clearPeerConnectedNotification(peerID: String) {
+        try {
+            val notificationId = activePeerConnectNotifications.remove(peerID) ?: return
+            notificationManager.cancel(notificationId)
+            Log.d(TAG, "Cleared peer connect notification for $peerID")
+        } catch (_: Exception) { }
+    }
+
     /**
      * Show a notification for a private message with proper grouping and state awareness
      */
@@ -149,7 +269,7 @@ class NotificationManager(
         // Only show notifications if app is in background OR user is not viewing this specific chat
         val shouldNotify = isAppInBackground ||
             (!isAppInBackground && currentPrivateChatPeer != conversationID)
-        
+
         if (!shouldNotify) {
             Log.d(TAG, "Skipping notification - app in foreground and viewing chat with $senderNickname")
             return
@@ -169,7 +289,7 @@ class NotificationManager(
 
         // Create or update notification for this sender
         showNotificationForSender(conversationID)
-        
+
         // Update summary notification if we have multiple senders
         if (pendingNotifications.size > 1) {
             showSummaryNotification()
@@ -254,19 +374,19 @@ class NotificationManager(
         if (messageCount > 1) {
             val style = NotificationCompat.InboxStyle()
                 .setBigContentTitle(contentTitle)
-            
+
             // Show last few messages in expanded view
             notifications.takeLast(5).forEach { notif ->
                 style.addLine(notif.messageContent)
             }
-            
+
             if (messageCount > 5) {
                 val extra = messageCount - 5
                 style.setSummaryText(context.resources.getQuantityString(
                     R.plurals.notification_and_more, extra, extra
                 ))
             }
-            
+
             builder.setStyle(style)
         } else {
             // Single message - use BigTextStyle for long messages
@@ -349,6 +469,7 @@ class NotificationManager(
         notificationManager.notify(ACTIVE_PEERS_NOTIFICATION_ID, builder.build())
         Log.d(TAG, "Displayed notification for $contentTitle with ID $ACTIVE_PEERS_NOTIFICATION_ID")
     }
+
     private fun showSummaryNotification() {
         if (pendingNotifications.isEmpty()) return
 
@@ -380,7 +501,7 @@ class NotificationManager(
         // Add inbox style showing recent senders
         val style = NotificationCompat.InboxStyle()
             .setBigContentTitle(context.getString(R.string.notification_new_location_messages))
-            
+
         pendingNotifications.entries.take(5).forEach { (peerID, notifications) ->
             val latestNotif = notifications.last()
             val count = notifications.size
@@ -391,11 +512,11 @@ class NotificationManager(
             }
             style.addLine(line)
         }
-        
+
         if (pendingNotifications.size > 5) {
             style.setSummaryText(context.getString(R.string.notification_more_conversations, pendingNotifications.size - 5))
         }
-        
+
         builder.setStyle(style)
 
         notificationManager.notify(SUMMARY_NOTIFICATION_ID, builder.build())
@@ -427,7 +548,7 @@ class NotificationManager(
             // Update summary notification
             showSummaryNotification()
         }
-        
+
         Log.d(TAG, "Cleared notifications for conversation: $conversationID")
     }
 
@@ -803,6 +924,9 @@ class NotificationManager(
         pendingNotifications.clear()
         notificationManager.cancelAll()
         pendingGeohashNotifications.clear()
+        // ⭐ NEW: also clear peer-connect tracking so state is fresh
+        activePeerConnectNotifications.clear()
+        peerConnectThrottle.clear()
         Log.d(TAG, "Cleared all notifications")
     }
 
@@ -846,6 +970,11 @@ class NotificationManager(
                 val mentions = notifications.count { it.isMention }
                 val firstMessages = notifications.count { it.isFirstMessage }
                 appendLine("  #$geohash: ${notifications.size} messages ($mentions mentions, $firstMessages first messages)")
+            }
+            // ⭐ NEW: peer connect debug
+            appendLine("Active peer-connect notifications: ${activePeerConnectNotifications.size}")
+            activePeerConnectNotifications.forEach { (peerID, id) ->
+                appendLine("  $peerID -> notifId $id")
             }
         }
     }
