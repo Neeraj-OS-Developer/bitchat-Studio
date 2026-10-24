@@ -27,6 +27,10 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Shared mesh coordinator that wires all mesh-layer components and provides common APIs
  * for send/receive operations across transports.
+ *
+ * ⭐ NEW: forwards per-peer connect / disconnect events from [PeerManager] up through
+ * [MeshDelegate] so the headless notification layer can react to peer lifecycle
+ * without the UI running.
  */
 class MeshCore(
     private val context: Context,
@@ -153,6 +157,26 @@ class MeshCore(
                 try { gossipSyncManager.removeAnnouncementForPeer(peerID) } catch (_: Exception) { }
                 try { encryptionService.removePeer(peerID) } catch (_: Exception) { }
                 try { peerManager.refreshPeerList() } catch (_: Exception) { }
+            }
+
+            // ⭐ NEW: forward per-peer connect event up to MeshDelegate
+            override fun onPeerConnected(peerID: String, nickname: String) {
+                try {
+                    Log.d("MeshCore", "[${transport.id}] peer connected: $nickname ($peerID)")
+                    delegate?.didPeerConnect(peerID, nickname)
+                } catch (e: Exception) {
+                    Log.w("MeshCore", "didPeerConnect forward failed for $peerID: ${e.message}")
+                }
+            }
+
+            // ⭐ NEW: forward per-peer disconnect event up to MeshDelegate
+            override fun onPeerDisconnected(peerID: String) {
+                try {
+                    Log.d("MeshCore", "[${transport.id}] peer disconnected: $peerID")
+                    delegate?.didPeerDisconnect(peerID)
+                } catch (e: Exception) {
+                    Log.w("MeshCore", "didPeerDisconnect forward failed for $peerID: ${e.message}")
+                }
             }
         }
 
